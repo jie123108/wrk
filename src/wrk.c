@@ -7,6 +7,7 @@
 static struct config {
     uint64_t connections;
     uint64_t duration;
+    uint64_t requests; //total requests
     uint64_t threads;
     uint64_t timeout;
     uint64_t pipeline;
@@ -35,6 +36,7 @@ static struct http_parser_settings parser_settings = {
 };
 
 static volatile sig_atomic_t stop = 0;
+static volatile sig_atomic_t reqs = 0;
 
 static void handler(int sig) {
     stop = 1;
@@ -45,6 +47,7 @@ static void usage() {
            "  Options:                                            \n"
            "    -c, --connections <N>  Connections to keep open   \n"
            "    -d, --duration    <T>  Duration of test           \n"
+           "    -r, --requests    <N>  Total Http Request       \n"
            "    -t, --threads     <N>  Number of threads to use   \n"
            "                                                      \n"
            "    -s, --script      <S>  Load Lua script file       \n"
@@ -140,7 +143,14 @@ int main(int argc, char **argv) {
     uint64_t bytes    = 0;
     errors errors     = { 0 };
 
-    sleep(cfg.duration);
+    if(cfg.requests > 0){
+	while(1){
+		if(stop){ break;}
+		usleep(1000*10);
+	}
+    }else{
+	 sleep(cfg.duration);
+    }
     stop = 1;
 
     for (uint64_t i = 0; i < cfg.threads; i++) {
@@ -173,18 +183,19 @@ int main(int argc, char **argv) {
     if (cfg.latency) print_stats_latency(statistics.latency);
 
     char *runtime_msg = format_time_us(runtime_us);
-
-    printf("  %"PRIu64" requests in %s, %sB read\n", complete, runtime_msg, format_binary(bytes));
+#define RED_BEGIN "\033[22;31m"
+#define CLR_END "\033[0m"
+    printf("  "RED_BEGIN"%"PRIu64 CLR_END" requests in "RED_BEGIN"%s"CLR_END", %sB read\n", complete, runtime_msg, format_binary(bytes));
     if (errors.connect || errors.read || errors.write || errors.timeout) {
-        printf("  Socket errors: connect %d, read %d, write %d, timeout %d\n",
+        printf(RED_BEGIN"  Socket errors: connect %d, read %d, write %d, timeout %d"CLR_END"\n",
                errors.connect, errors.read, errors.write, errors.timeout);
     }
 
     if (errors.status) {
-        printf("  Non-2xx or 3xx responses: %d\n", errors.status);
+        printf(RED_BEGIN"  Non-2xx or 3xx responses: %d"CLR_END"\n", errors.status);
     }
 
-    printf("Requests/sec: %9.2Lf\n", req_per_s);
+    printf("Requests/sec: "RED_BEGIN"%9.2Lf"CLR_END"\n", req_per_s);
     printf("Transfer/sec: %10sB\n", format_binary(bytes_per_s));
 
     if (script_has_done(L)) {
@@ -382,6 +393,10 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     connection *c = data;
     thread *thread = c->thread;
 
+    if(cfg.requests > 0 && __sync_add_and_fetch(&reqs, 1) >= cfg.requests){
+	stop = 1;
+    }
+	
     if (c->delayed) {
         uint64_t delay = script_delay(thread->L);
         aeDeleteFileEvent(loop, fd, AE_WRITABLE);
@@ -406,12 +421,13 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
         case ERROR: goto error;
         case RETRY: return;
     }
-
+   
     c->written += n;
     if (c->written == c->length) {
         c->written = 0;
         aeDeleteFileEvent(loop, fd, AE_WRITABLE);
     }
+
 
     return;
 
@@ -466,6 +482,7 @@ static char *copy_url_part(char *url, struct http_parser_url *parts, enum http_p
 static struct option longopts[] = {
     { "connections", required_argument, NULL, 'c' },
     { "duration",    required_argument, NULL, 'd' },
+    { "requests",    required_argument, NULL, 'r' },    
     { "threads",     required_argument, NULL, 't' },
     { "script",      required_argument, NULL, 's' },
     { "header",      required_argument, NULL, 'H' },
@@ -486,7 +503,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->duration    = 10;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "r:t:c:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -497,6 +514,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
             case 'd':
                 if (scan_time(optarg, &cfg->duration)) return -1;
                 break;
+	    case 'r':
+                if (scan_metric(optarg, &cfg->requests)) return -1;
+		 break;
             case 's':
                 cfg->script = optarg;
                 break;
